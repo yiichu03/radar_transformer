@@ -11,13 +11,16 @@
 #
 # You can contact the author at <jan.michalczyk@aau.at>
 
+import argparse
 import statistics
 
 import numpy as np
 import sys
 import pathlib
 import rosbag
+import rospy
 import sensor_msgs.point_cloud2 as pc2
+from sensor_msgs.msg import PointCloud2
 from radar_deep_matcher.msg import PointcloudInput
 from scipy.optimize import linear_sum_assignment
 import matplotlib.pyplot as plt
@@ -58,7 +61,7 @@ def get_input_file_folder(mode):
 
 def plot_flattened_matches(flattened_matches, pred, pc1_size, pc2_size, matches_dict):
     prediction = torch.transpose(
-        pred, 0, 1).detach().numpy()
+        pred, 0, 1).detach().cpu().numpy()
     # Unflatten matches.
     matches = np.reshape(flattened_matches, (-1, 6))
     fig = plt.figure(figsize=(10, 5))
@@ -215,8 +218,8 @@ def plot_flattened_matches(flattened_matches, pred, pc1_size, pc2_size, matches_
 
 
 def plot_matches(matches_dict, model_input):
-    model_input = model_input.reshape(
-        (model_input.size()[1] // 3, 3)).detach().numpy()
+    model_input = model_input.detach().cpu().reshape(
+        (model_input.size()[1] // 3, 3)).numpy()
     input_pc_1 = model_input[:(model_input.shape[0] // 2), :]
     input_pc_2 = model_input[(model_input.shape[0] // 2):, :]
     pc1_size, pc2_size = evaluate_matchings.calculate_non_padded_pc_sizes(
@@ -270,12 +273,13 @@ def plot_matches(matches_dict, model_input):
 
 
 class PointcloudPreprocessor:
-    def __init__(self, input_bag_folders):
+    def __init__(self, input_bag_folders=None, default_max_size=121):
         self.is_previous_pc2_nonempty = False
-        # Get the maximum length of a pointcloud in the dataset.
-        all_bags = utils.get_bags_from_paths(input_bag_folders)
-        # self.max_pc2_size_in_data = utils.get_max_pc2_size_in_data(all_bags)
-        self.max_pc2_size_in_data = 121
+        if input_bag_folders:
+            all_bags = utils.get_bags_from_paths(input_bag_folders)
+            self.max_pc2_size_in_data = utils.get_max_pc2_size_in_data(all_bags)
+        else:
+            self.max_pc2_size_in_data = default_max_size
 
     def build_input_to_model(self, current_pc2):
         current_pc2_as_mat = \
@@ -296,9 +300,9 @@ class PointcloudPreprocessor:
     def get_matches_from_prediction(self, prediction, model_input):
         # TODO: include some basic outlier removal here.
         prediction = torch.transpose(
-            prediction, 0, 1).detach().numpy()
-        model_input = model_input.reshape(
-            (model_input.size()[1] // 3, 3)).detach().numpy()
+            prediction, 0, 1).detach().cpu().numpy()
+        model_input = model_input.detach().cpu().reshape(
+            (model_input.size()[1] // 3, 3)).numpy()
         pc1_size, pc2_size = evaluate_matchings.calculate_non_padded_pc_sizes(
             model_input, model_input.shape[0] // 2)
         # Run LSA on the calculated matrix.
@@ -317,8 +321,8 @@ class PointcloudPreprocessor:
         # Output the matches as an array where indices are indices of points in pc1
         # (previous) and values are indexes in pc2 (current).
         if matches_dict:
-            model_input_as_np = model_input.reshape(
-                (model_input.size()[1] // 3, 3)).detach().numpy()
+            model_input_as_np = model_input.detach().cpu().reshape(
+                (model_input.size()[1] // 3, 3)).numpy()
             model_input_as_np = utils.apply_inv_radar_imu_transform_to_single_pointcloud(prepare_dataset.RADAR_TO_IMU_ROTATION,
                                                                                          prepare_dataset.RADAR_TO_IMU_TRANSLATION,
                                                                                          model_input_as_np)
@@ -345,48 +349,123 @@ class PointcloudPreprocessor:
             pointcloud_input_msg.has_matches = True
 
 
-def main():
-    input_filepath = get_input_file_folder("test") / EVAL_BAG
-    input_bag = rosbag.Bag(input_filepath)
-    output_bag = rosbag.Bag(EVAL_BAG.split(
-        '.')[0] + "_DL_replayed" + ".bag", 'w')
-
-    input_bag_folders = []
-    for mode in ["train", "test"]:
-        input_bag_folders.append(get_input_file_folder(mode))
-
-    pointcloud_preprocessor = PointcloudPreprocessor(input_bag_folders)
-    input_length = 2 * (3 * pointcloud_preprocessor.max_pc2_size_in_data + 3)
-
+def load_matcher_model(max_pc2_size_in_data):
+    input_length = 2 * (3 * max_pc2_size_in_data + 3)
     model_filepath = get_root_folder() / MODEL_DIR / MODEL_FILE
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = transformer_models.RadarDeepMatcher(input_length)
+    model = transformer_models.RadarDeepMatcher(input_length).to(device)
+    state = torch.load(model_filepath, map_location=device, weights_only=True)
+    model.load_state_dict(state)
     model.eval()
-    model.load_state_dict(torch.load(
-        model_filepath, weights_only=True, map_location=torch.device(device)))
-    i = 0
-    for topic, msg, t in input_bag.read_messages():
-        if topic == PC2_TOPIC_NAME and msg.fields:
-            pointcloud_input_msg = PointcloudInput()
-            pointcloud_input_msg.header = msg.header
-            pointcloud_input_msg.has_matches = False
-            pointcloud_input_msg.current_pointcloud = msg
-            input, input_non_empty = pointcloud_preprocessor.build_input_to_model(
-                msg)
-            if input_non_empty:
-                # Do inference and write the matches into the message.
-                input_tensor = torch.from_numpy(input).to(device)
-                prediction = model(input_tensor)
-                matches, pc1_size, pc2_size = pointcloud_preprocessor.get_matches_from_prediction(
-                    prediction[0, :, :], input_tensor)
-                pointcloud_preprocessor.build_output_msg_from_prediction(
-                    matches, input_tensor, pointcloud_input_msg, i, prediction[0, :, :], pc1_size, pc2_size)
-            output_bag.write(MATCHINGS_TOPIC_NAME, pointcloud_input_msg, t)
-            i = i + 1
-        # Write through all messages.
-        output_bag.write(topic, msg, t)
-    input_bag.close()
-    output_bag.close()
+    return model, device
+
+
+def build_pointcloud_input_msg(msg, pointcloud_preprocessor, model, device, index):
+    pointcloud_input_msg = PointcloudInput()
+    pointcloud_input_msg.header = msg.header
+    pointcloud_input_msg.has_matches = False
+    pointcloud_input_msg.current_pointcloud = msg
+    model_input, input_non_empty = pointcloud_preprocessor.build_input_to_model(
+        msg)
+    if input_non_empty and model_input is not None:
+        with torch.no_grad():
+            input_tensor = torch.from_numpy(model_input).to(device, non_blocking=True)
+            prediction = model(input_tensor)
+        matches, pc1_size, pc2_size = pointcloud_preprocessor.get_matches_from_prediction(
+            prediction[0, :, :], input_tensor)
+        pointcloud_preprocessor.build_output_msg_from_prediction(
+            matches, input_tensor, pointcloud_input_msg, index,
+            prediction[0, :, :], pc1_size, pc2_size)
+    return pointcloud_input_msg
+
+
+def run_offline(args):
+    input_path = pathlib.Path(args.bag).expanduser()
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input bag not found: {input_path}")
+    if args.output_bag:
+        output_path = pathlib.Path(args.output_bag).expanduser()
+    else:
+        output_path = input_path.with_name(input_path.stem + "_DL_replayed.bag")
+    pointcloud_preprocessor = PointcloudPreprocessor()
+    model, device = load_matcher_model(
+        pointcloud_preprocessor.max_pc2_size_in_data)
+    rospy.loginfo("Offline mode: reading %s", input_path)
+    print("Offline mode: reading" + input_path)
+    with rosbag.Bag(str(input_path)) as input_bag, rosbag.Bag(
+            str(output_path), 'w') as output_bag:
+        rospy.loginfo("Writing transformer matches to %s", output_path)
+        print("Writing transformer matches to " + input_path)
+        frame_idx = 0
+        for topic, msg, t in input_bag.read_messages():
+            if topic == PC2_TOPIC_NAME and msg.fields:
+                pointcloud_input_msg = build_pointcloud_input_msg(
+                    msg, pointcloud_preprocessor, model, device, frame_idx)
+                output_bag.write(MATCHINGS_TOPIC_NAME, pointcloud_input_msg, t)
+                frame_idx += 1
+                if frame_idx % 50 == 0:
+                    rospy.loginfo("Processed %d radar frames", frame_idx)
+                    print("Processed" + frame_idx + "radar frames")
+            output_bag.write(topic, msg, t)
+    rospy.loginfo("Finished offline processing of %s (%d frames)", input_path,
+                  frame_idx)
+    print("Finished offline processing of" + input_path + "(" + frame_idx +  "frames)")
+
+
+def run_live(args):
+    rospy.init_node("radar_transformer_matcher", anonymous=False)
+    pointcloud_preprocessor = PointcloudPreprocessor(
+        default_max_size=args.max_pc_size)
+    model, device = load_matcher_model(
+        pointcloud_preprocessor.max_pc2_size_in_data)
+    publisher = rospy.Publisher(MATCHINGS_TOPIC_NAME, PointcloudInput,
+                                queue_size=10)
+    frame_idx = {"value": 0}
+
+    def callback(msg):
+        pointcloud_input_msg = build_pointcloud_input_msg(
+            msg, pointcloud_preprocessor, model, device, frame_idx["value"])
+        publisher.publish(pointcloud_input_msg)
+        frame_idx["value"] += 1
+        if frame_idx["value"] % 20 == 0:
+            rospy.loginfo("Published %d live transformer match messages",
+                          frame_idx["value"])
+
+    rospy.Subscriber(args.topic, PointCloud2, callback, queue_size=1)
+    rospy.loginfo("Radar transformer matcher live mode started. "
+                  "Listening to %s and publishing matches on %s",
+                  args.topic, MATCHINGS_TOPIC_NAME)
+    rospy.spin()
+
+
+def parse_cli_args():
+    parser = argparse.ArgumentParser(
+        description="Radar transformer matcher for offline bags or live topics.")
+    parser.add_argument("--bag", type=str,
+                        help="Path to the input bag for offline processing.")
+    parser.add_argument("--output_bag", type=str,
+                        help="Optional path for the output bag in offline mode.")
+    parser.add_argument("--live", action="store_true",
+                        help="Enable live mode (subscribe to a radar topic).")
+    parser.add_argument("--topic", type=str, default=PC2_TOPIC_NAME,
+                        help="Radar PointCloud2 topic to subscribe in live mode.")
+    parser.add_argument("--max_pc_size", type=int, default=121,
+                        help="Fallback max pointcloud size when dataset stats "
+                             "are unavailable.")
+    args = parser.parse_args(rospy.myargv(argv=sys.argv)[1:])
+    if args.live and args.bag:
+        parser.error("Choose either --bag for offline mode or --live for online mode, not both.")
+    if not args.live and not args.bag:
+        parser.error("Provide --bag for offline mode or use --live for online operation.")
+    return args
+
+
+def main():
+    args = parse_cli_args()
+    if args.live:
+        run_live(args)
+    else:
+        run_offline(args)
 
 
 if __name__ == '__main__':
