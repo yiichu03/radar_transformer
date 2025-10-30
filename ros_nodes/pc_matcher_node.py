@@ -17,7 +17,6 @@ import statistics
 import numpy as np
 import sys
 import pathlib
-import rosbag
 import rospy
 import sensor_msgs.point_cloud2 as pc2
 from sensor_msgs.msg import PointCloud2
@@ -35,7 +34,6 @@ torch.set_default_dtype(torch.float32)
 
 PC2_TOPIC_NAME = "/mmWaveDataHdl/RScan"
 MATCHINGS_TOPIC_NAME = "/pointcloud_input"
-EVAL_BAG = "edgar_classroom_run0.bag"
 PACKAGE_ROOT_FOLDER = "radar_transformer"
 MODEL_DIR = "saved_models"
 MODEL_FILE = "model.ptm"
@@ -52,12 +50,6 @@ import utils  # nopep8
 import transformer_models  # nopep8
 import evaluate_matchings  # nopep8
 import prepare_dataset  # nopep8
-
-
-def get_input_file_folder(mode):
-    file_folder = "input_" + mode + "_files"
-    return get_root_folder() / file_folder
-
 
 def plot_flattened_matches(flattened_matches, pred, pc1_size, pc2_size, matches_dict):
     prediction = torch.transpose(
@@ -379,39 +371,6 @@ def build_pointcloud_input_msg(msg, pointcloud_preprocessor, model, device, inde
     return pointcloud_input_msg
 
 
-def run_offline(args):
-    input_path = pathlib.Path(args.bag).expanduser()
-    if not input_path.exists():
-        raise FileNotFoundError(f"Input bag not found: {input_path}")
-    if args.output_bag:
-        output_path = pathlib.Path(args.output_bag).expanduser()
-    else:
-        output_path = input_path.with_name(input_path.stem + "_DL_replayed.bag")
-    pointcloud_preprocessor = PointcloudPreprocessor()
-    model, device = load_matcher_model(
-        pointcloud_preprocessor.max_pc2_size_in_data)
-    rospy.loginfo("Offline mode: reading %s", input_path)
-    print("Offline mode: reading" + input_path)
-    with rosbag.Bag(str(input_path)) as input_bag, rosbag.Bag(
-            str(output_path), 'w') as output_bag:
-        rospy.loginfo("Writing transformer matches to %s", output_path)
-        print("Writing transformer matches to " + input_path)
-        frame_idx = 0
-        for topic, msg, t in input_bag.read_messages():
-            if topic == PC2_TOPIC_NAME and msg.fields:
-                pointcloud_input_msg = build_pointcloud_input_msg(
-                    msg, pointcloud_preprocessor, model, device, frame_idx)
-                output_bag.write(MATCHINGS_TOPIC_NAME, pointcloud_input_msg, t)
-                frame_idx += 1
-                if frame_idx % 50 == 0:
-                    rospy.loginfo("Processed %d radar frames", frame_idx)
-                    print("Processed" + frame_idx + "radar frames")
-            output_bag.write(topic, msg, t)
-    rospy.loginfo("Finished offline processing of %s (%d frames)", input_path,
-                  frame_idx)
-    print("Finished offline processing of" + input_path + "(" + frame_idx +  "frames)")
-
-
 def run_live(args):
     rospy.init_node("radar_transformer_matcher", anonymous=False)
     pointcloud_preprocessor = PointcloudPreprocessor(
@@ -440,32 +399,18 @@ def run_live(args):
 
 def parse_cli_args():
     parser = argparse.ArgumentParser(
-        description="Radar transformer matcher for offline bags or live topics.")
-    parser.add_argument("--bag", type=str,
-                        help="Path to the input bag for offline processing.")
-    parser.add_argument("--output_bag", type=str,
-                        help="Optional path for the output bag in offline mode.")
-    parser.add_argument("--live", action="store_true",
-                        help="Enable live mode (subscribe to a radar topic).")
+        description="Radar transformer matcher (live ROS topic only).")
     parser.add_argument("--topic", type=str, default=PC2_TOPIC_NAME,
                         help="Radar PointCloud2 topic to subscribe in live mode.")
     parser.add_argument("--max_pc_size", type=int, default=121,
                         help="Fallback max pointcloud size when dataset stats "
                              "are unavailable.")
-    args = parser.parse_args(rospy.myargv(argv=sys.argv)[1:])
-    if args.live and args.bag:
-        parser.error("Choose either --bag for offline mode or --live for online mode, not both.")
-    if not args.live and not args.bag:
-        parser.error("Provide --bag for offline mode or use --live for online operation.")
-    return args
+    return parser.parse_args(rospy.myargv(argv=sys.argv)[1:])
 
 
 def main():
     args = parse_cli_args()
-    if args.live:
-        run_live(args)
-    else:
-        run_offline(args)
+    run_live(args)
 
 
 if __name__ == '__main__':

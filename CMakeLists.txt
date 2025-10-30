@@ -8,6 +8,7 @@ find_package(catkin REQUIRED COMPONENTS
   rospy
   std_msgs
   sensor_msgs
+  geometry_msgs
   message_generation
   genmsg
 )
@@ -45,6 +46,7 @@ find_package(catkin REQUIRED COMPONENTS
  add_message_files(
    FILES
    PointcloudInput.msg
+   RpmnetRelativePose.msg
  )
 
 ## Generate services in the 'srv' folder
@@ -66,6 +68,7 @@ find_package(catkin REQUIRED COMPONENTS
    DEPENDENCIES
    std_msgs
    sensor_msgs
+   geometry_msgs
  )
 
 ################################################
@@ -98,7 +101,7 @@ find_package(catkin REQUIRED COMPONENTS
 ## CATKIN_DEPENDS: catkin_packages dependent projects also need
 ## DEPENDS: system dependencies of this project that dependent projects also need
 catkin_package(
-  CATKIN_DEPENDS rospy message_runtime
+  CATKIN_DEPENDS rospy geometry_msgs message_runtime
 )
 
 ###########
