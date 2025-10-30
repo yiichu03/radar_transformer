@@ -14,3 +14,8 @@ If you use this software please cite:
       url={https://arxiv.org/abs/2506.18580}, 
 }
 ```
+
+# Remarks
+If training on your data then make sure to include correct transformation between IMU and Radar sensors in the `prepare_dataset.py` script.
+This is because input to the network are pointclouds in the IMU frame. Also, make sure to adapt the training/inference script to your sensor's
+FOV and set the DC filtering offset in the `utils.py` script. DC offset is a constant detection close to (0, 0) caused by antennas cross-talk.
