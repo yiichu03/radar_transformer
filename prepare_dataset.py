@@ -23,6 +23,7 @@ from scipy.spatial.transform import Rotation as R
 # `data/{train|test}/pointclouds.hdf5` and `data/{train|test}/labels.hdf5`.
 # TODO(jan): externalize parameters into a json file.
 
+# The parameters below are for the coloradar dataset.
 RADAR_TO_BASE_ROTATION = R.from_quat(
     [0.0, 0.0, 0.706825181105, 0.707388269167]).as_matrix()
 RADAR_TO_BASE_TRANSLATION = np.array([[-0.145, 0.09, -0.025]])
