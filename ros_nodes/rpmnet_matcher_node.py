@@ -33,7 +33,8 @@ from tools import estimate_normals_for_radar  # type: ignore  # noqa: E402
 PC2_TOPIC_NAME = "/mmWaveDataHdl/RScan"
 MATCHINGS_TOPIC_NAME = "/rpmnet/pointcloud_input"
 POSE_TOPIC_NAME = "/rpmnet/relative_pose"
-DEFAULT_TARGET_POINTS = 1024
+DEFAULT_TARGET_POINTS = 1024 # 1024
+DEFAULT_RANDOM_SEED = 42
 
 
 def to_tensor(array: np.ndarray, device: torch.device) -> torch.Tensor:
@@ -112,6 +113,11 @@ class RpmnetMatcher:
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
+        self._seed = DEFAULT_RANDOM_SEED
+        np.random.seed(self._seed)
+        torch.manual_seed(self._seed)
+        if self.device.type == "cuda":
+            torch.cuda.manual_seed_all(self._seed)
         parser = rpmnet_eval_arguments()
         self.model_args = parser.parse_args([])
         self.model_args.resume = args.checkpoint
