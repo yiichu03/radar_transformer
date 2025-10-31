@@ -1,9 +1,10 @@
 #! /usr/bin/env python3
+
 import argparse
 import pathlib
 import sys
 from dataclasses import dataclass
-from typing import Callable, Optional, Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import rospy
@@ -12,8 +13,6 @@ import torch
 from geometry_msgs.msg import Pose, Quaternion
 from radar_deep_matcher.msg import PointcloudInput, RpmnetRelativePose
 from sensor_msgs.msg import PointCloud2
-from scipy.optimize import linear_sum_assignment
-
 
 try:
     import open3d as o3d  # noqa: F401
@@ -35,19 +34,6 @@ PC2_TOPIC_NAME = "/mmWaveDataHdl/RScan"
 MATCHINGS_TOPIC_NAME = "/rpmnet/pointcloud_input"
 POSE_TOPIC_NAME = "/rpmnet/relative_pose"
 DEFAULT_TARGET_POINTS = 1024
-
-PACKAGE_ROOT_FOLDER = "radar_transformer"
-
-def get_root_folder():
-    current_file_path = pathlib.Path(__file__).resolve()
-    package_root_index = current_file_path.parts.index(PACKAGE_ROOT_FOLDER)
-    return pathlib.Path(*current_file_path.parts[:package_root_index + 1])
-
-root_folder = get_root_folder()
-sys.path.append(root_folder.parent.as_posix())
-sys.path.append(root_folder.as_posix())
-from radar_transformer import utils as rt_utils  # noqa: E402
-from radar_transformer import prepare_dataset as rt_prepare  # noqa: E402
 
 
 def to_tensor(array: np.ndarray, device: torch.device) -> torch.Tensor:
@@ -76,20 +62,13 @@ def matrix_from_transform(transform: torch.Tensor) -> np.ndarray:
 
 def flatten_matches(src_points: np.ndarray, ref_points: np.ndarray,
                     assignment: np.ndarray, weights: np.ndarray,
-                    min_weight: float, max_count: int,
-                    top_k: bool = False,
-                    fov_filter: Optional[Callable[[np.ndarray, np.ndarray], bool]] = None) -> np.ndarray:
+                    min_weight: float, max_count: int) -> np.ndarray:
     valid_idx = np.where((assignment >= 0) & (weights >= min_weight))[0]
     if valid_idx.size == 0:
         return np.empty(0, dtype=np.float64)
-    if top_k:
-        order = np.argsort(weights[valid_idx])[::-1]
-        valid_idx = valid_idx[order]
     matches = []
     for idx in valid_idx[:max_count]:
         dst_idx = assignment[idx]
-        if fov_filter is not None and not fov_filter(src_points[idx], ref_points[dst_idx]):
-            continue
         matches.append(np.concatenate([src_points[idx], ref_points[dst_idx]], axis=0))
     if not matches:
         return np.empty(0, dtype=np.float64)
@@ -101,46 +80,37 @@ def read_pointcloud(msg: PointCloud2) -> np.ndarray:
     return points.astype(np.float32)
 
 
-def downsample(points: np.ndarray, target: int) -> Tuple[np.ndarray, np.ndarray]:
-    n = points.shape[0]
-    if n == 0:
-        return np.zeros((target, 3), dtype=np.float32), np.zeros(target, dtype=np.int64)
-    if n >= target:
-        indices = np.random.choice(n, target, replace=False)
-    else:
-        pad = target - n
-        pad_indices = np.random.choice(n, pad, replace=True)
-        indices = np.concatenate([np.arange(n), pad_indices])
-    return points[indices], indices
+def downsample(points: np.ndarray, target: int) -> np.ndarray:
+    if points.shape[0] == 0:
+        return np.zeros((target, 3), dtype=np.float32)
+    if points.shape[0] >= target:
+        indices = np.random.choice(points.shape[0], target, replace=False)
+        return points[indices]
+    pad = target - points.shape[0]
+    pad_indices = np.random.choice(points.shape[0], pad, replace=True)
+    return np.concatenate([points, points[pad_indices]], axis=0)
 
 
-def prepare_points(radar_points: np.ndarray, imu_points: np.ndarray,
-                   target: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    sampled_imu, indices = downsample(imu_points, target)
-    if radar_points.shape[0] == 0:
-        sampled_radar = np.zeros((target, 3), dtype=np.float32)
-    else:
-        sampled_radar = radar_points[indices]
-    normals, _ = estimate_normals_for_radar(sampled_imu, k=20)
+def prepare_points(points: np.ndarray, target: int) -> Tuple[np.ndarray, np.ndarray]:
+    sampled = downsample(points, target)
+    normals, _ = estimate_normals_for_radar(sampled, k=20)
     valid = np.linalg.norm(normals, axis=1) > 1e-6
     normals[~valid] = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-    stacked = np.concatenate([sampled_imu, normals], axis=1)
-    return sampled_radar.astype(np.float32), sampled_imu.astype(np.float32), stacked
+    stacked = np.concatenate([sampled, normals], axis=1)
+    return sampled, stacked
 
 
 @dataclass
 class PreparedScan:
     stamp: rospy.Time
     raw_msg: PointCloud2
-    xyz: np.ndarray  # radar frame points fed to matcher output
-    imu_xyz: np.ndarray
+    xyz: np.ndarray
     xyz_normals: np.ndarray
 
 
 class RpmnetMatcher:
     def __init__(self, args: argparse.Namespace):
         self.args = args
-        self.match_passes = max(1, args.match_passes)
         self.device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
         parser = rpmnet_eval_arguments()
         self.model_args = parser.parse_args([])
@@ -163,19 +133,11 @@ class RpmnetMatcher:
         return model
 
     def process(self, msg: PointCloud2):
-        radar_points = read_pointcloud(msg)
-        if radar_points.size == 0:
+        points = read_pointcloud(msg)
+        if points.size == 0:
             return None, None
-        imu_points = rt_utils.apply_radar_imu_transform_to_single_pointcloud(
-            rt_prepare.RADAR_TO_IMU_ROTATION,
-            rt_prepare.RADAR_TO_IMU_TRANSLATION,
-            radar_points).astype(np.float32)
-        sampled_radar, sampled_imu, sampled_with_normals = prepare_points(
-            radar_points.astype(np.float32), imu_points, self.target_points)
-        scan = PreparedScan(msg.header.stamp, msg,
-                            sampled_radar,
-                            sampled_imu,
-                            sampled_with_normals)
+        xyz, xyz6 = prepare_points(points, self.target_points)
+        scan = PreparedScan(msg.header.stamp, msg, xyz, xyz6)
         if self.prev_scan is None:
             self.prev_scan = scan
             return None, None
@@ -192,46 +154,28 @@ class RpmnetMatcher:
             transforms, endpoints = self.model(batch, self.args.num_iter)
         transform = transforms[-1][0] if isinstance(transforms, list) else transforms[0, -1]
         T = matrix_from_transform(transform)
+
         matches_msg = None
         pose_msg = None
         if not self.args.pose_only:
-            perm_seq = endpoints['perm_matrices']
-            perm_init_seq = endpoints.get('perm_matrices_init', perm_seq)
-            num_passes = min(self.match_passes, len(perm_seq))
-            perm_tensors = [perm_seq[-(i + 1)][0] for i in range(num_passes)]
-            perm_init_tensors = [perm_init_seq[-(i + 1)][0] for i in range(num_passes)]
-            perm_np = np.mean([p.detach().cpu().numpy() for p in perm_tensors], axis=0)
-            perm_pre_np = np.mean([p.detach().cpu().numpy() for p in perm_init_tensors], axis=0)
-            if self.args.hungarian_matches:
-                cost = -perm_pre_np
-                row_ind, col_ind = linear_sum_assignment(cost)
-                selected_vals = perm_pre_np[row_ind, col_ind] if row_ind.size else np.array([], dtype=np.float64)
-                max_val = selected_vals.max() if selected_vals.size else 0.0
-                threshold = max_val / 1.3 if max_val > 0 else 0.0
-                keep_mask = selected_vals > threshold
-                row_ind = row_ind[keep_mask]
-                col_ind = col_ind[keep_mask]
-                assignment = -np.ones(perm_np.shape[0], dtype=int)
-                assignment[row_ind] = col_ind
-                weights = np.zeros(perm_np.shape[0], dtype=np.float64)
-                weights[row_ind] = perm_pre_np[row_ind, col_ind]
-                flattened = flatten_matches(
-                    src_scan.xyz, ref_scan.xyz,
-                    assignment, weights,
-                    self.args.match_threshold, self.args.max_matches,
-                    top_k=self.args.topk_matches,
-                    fov_filter=lambda prev_pt, curr_pt: rt_utils.is_in_fov(
-                        np.vstack((prev_pt, curr_pt))))
-            else:
-                assignment = np.argmax(perm_np, axis=1)
-                weights = perm_np[np.arange(perm_np.shape[0]), assignment]
-                flattened = flatten_matches(
-                    src_scan.xyz, ref_scan.xyz, assignment, weights,
-                    self.args.match_threshold, self.args.max_matches,
-                    top_k=self.args.topk_matches,
-                    fov_filter=lambda prev_pt, curr_pt: rt_utils.is_in_fov(
-                        np.vstack((prev_pt, curr_pt))))
-            if flattened.size > 0:
+            perm = endpoints['perm_matrices'][-1][0]
+            perm_np = perm.detach().cpu().numpy()
+            weights = perm_np.sum(axis=1)
+            weighted_ref = endpoints['weighted_ref'][-1][0].detach().cpu().numpy()
+            matches_list = []
+            max_count = min(self.args.max_matches, src_scan.xyz.shape[0])
+            for idx in range(max_count):
+                weight_val = float(weights[idx]) if idx < weights.shape[0] else 0.0
+                if weight_val < self.args.match_threshold:
+                    continue
+                prev_pt = src_scan.xyz[idx]
+                curr_pt = weighted_ref[idx]
+                if np.isnan(curr_pt).any():
+                    continue
+                matches_list.append(np.concatenate([prev_pt, curr_pt, [weight_val]], axis=0))
+
+            if matches_list:
+                flattened = np.asarray(matches_list, dtype=np.float64).reshape(-1)
                 matches_msg = PointcloudInput()
                 matches_msg.header = ref_scan.raw_msg.header
                 matches_msg.has_matches = True
@@ -242,6 +186,7 @@ class RpmnetMatcher:
                 matches_msg.header = ref_scan.raw_msg.header
                 matches_msg.has_matches = False
                 matches_msg.current_pointcloud = ref_scan.raw_msg
+
         if self.args.pose_only or self.args.publish_pose:
             pose_msg = RpmnetRelativePose()
             pose_msg.header = ref_scan.raw_msg.header
@@ -256,12 +201,12 @@ class RpmnetMatcher:
             cov[3:, 3:] = np.eye(3) * (self.args.pose_cov_rot ** 2)
             pose_msg.covariance = cov.reshape(-1)
             pose_msg.has_covariance = True
+
         return matches_msg, pose_msg
 
 
 def run_live(args):
     rospy.init_node("rpmnet_matcher", anonymous=False)
-    args.match_passes = rospy.get_param("~match_passes", args.match_passes)
     matcher = RpmnetMatcher(args)
     matches_pub = rospy.Publisher(MATCHINGS_TOPIC_NAME, PointcloudInput, queue_size=5)
     pose_pub = rospy.Publisher(POSE_TOPIC_NAME, RpmnetRelativePose, queue_size=5)
@@ -287,12 +232,6 @@ def parse_args():
     parser.add_argument("--target_points", type=int, default=DEFAULT_TARGET_POINTS)
     parser.add_argument("--max_matches", type=int, default=300)
     parser.add_argument("--match_threshold", type=float, default=0.02)
-    parser.add_argument("--match_passes", type=int, default=1,
-                        help="Number of RPMNet permutation iterations to aggregate")
-    parser.add_argument("--hungarian_matches", action="store_true",
-                        help="Use Hungarian assignment for correspondences")
-    parser.add_argument("--topk_matches", action="store_true",
-                        help="Select top-K matches by weight before truncation")
     parser.add_argument("--num_iter", type=int, default=5)
     parser.add_argument("--num_neighbors", type=int, default=64)
     parser.add_argument("--radius", type=float, default=0.3)
