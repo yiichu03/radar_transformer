@@ -82,17 +82,14 @@ def read_pointcloud(msg: PointCloud2) -> np.ndarray:
 
 
 def downsample(points: np.ndarray, target: int) -> np.ndarray:
-    if points.shape[0] == 0:
-        return np.zeros((target, 3), dtype=np.float32)
-    if points.shape[0] >= target:
-        indices = np.random.choice(points.shape[0], target, replace=False)
-        return points[indices]
-    pad = target - points.shape[0]
-    pad_indices = np.random.choice(points.shape[0], pad, replace=True)
-    return np.concatenate([points, points[pad_indices]], axis=0)
+    # Return original points without resampling.
+    return points
 
 
 def prepare_points(points: np.ndarray, target: int) -> Tuple[np.ndarray, np.ndarray]:
+    if points.shape[0] == 0:
+        empty_xyz = np.zeros((0, 3), dtype=np.float32)
+        return empty_xyz, np.zeros((0, 6), dtype=np.float32)
     sampled = downsample(points, target)
     normals, _ = estimate_normals_for_radar(sampled, k=20)
     valid = np.linalg.norm(normals, axis=1) > 1e-6
@@ -239,8 +236,8 @@ def parse_args():
     parser.add_argument("--max_matches", type=int, default=300)
     parser.add_argument("--match_threshold", type=float, default=0.02)
     parser.add_argument("--num_iter", type=int, default=5)
-    parser.add_argument("--num_neighbors", type=int, default=64)
-    parser.add_argument("--radius", type=float, default=0.3)
+    parser.add_argument("--num_neighbors", type=int, default=20) # 64
+    parser.add_argument("--radius", type=float, default=2) # 
     parser.add_argument("--pose_only", action="store_true",
                         help="Only publish transform measurements")
     parser.add_argument("--publish_pose", action="store_true",
