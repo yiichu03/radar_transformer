@@ -75,6 +75,7 @@ class LiveMatcherNode:
         pointcloud_input_msg.has_matches = False
         pointcloud_input_msg.current_pointcloud = msg
 
+        matches_used = 0
         model_input, input_non_empty = self.preprocessor.build_input_to_model(msg)
         if input_non_empty and model_input is not None:
             input_tensor = torch.from_numpy(model_input).to(self.device)
@@ -94,8 +95,16 @@ class LiveMatcherNode:
                 pc1_size,
                 pc2_size,
             )
+            matches_used = len(matches)
         self.frame_index += 1
         self.pub_matches.publish(pointcloud_input_msg)
+        if self.frame_index % 50 == 0:
+            rospy.loginfo(
+                "[transformer_live] processed %d frames, matches in last frame: %d (has_matches=%s)",
+                self.frame_index,
+                matches_used,
+                pointcloud_input_msg.has_matches,
+            )
 
 
 def main() -> None:
