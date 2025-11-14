@@ -270,12 +270,15 @@ def plot_matches(matches_dict, model_input):
 
 
 class PointcloudPreprocessor:
-    def __init__(self, input_bag_folders):
+    def __init__(self, input_bag_folders=None, max_pc2_size_in_data=121):
         self.is_previous_pc2_nonempty = False
-        # Get the maximum length of a pointcloud in the dataset.
-        all_bags = utils.get_bags_from_paths(input_bag_folders)
-        # self.max_pc2_size_in_data = utils.get_max_pc2_size_in_data(all_bags)
-        self.max_pc2_size_in_data = 121
+        if input_bag_folders is not None:
+            # Get the maximum length of a pointcloud in the dataset.
+            _ = utils.get_bags_from_paths(input_bag_folders)
+            # self.max_pc2_size_in_data = utils.get_max_pc2_size_in_data(all_bags)
+            self.max_pc2_size_in_data = max_pc2_size_in_data
+        else:
+            self.max_pc2_size_in_data = max_pc2_size_in_data
 
     def build_input_to_model(self, current_pc2):
         current_pc2_as_mat = \
